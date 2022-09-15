@@ -31,6 +31,7 @@ import (
 // store.
 type BadgerMetastore struct {
 	tracer trace.Tracer
+	logger log.Logger
 
 	db *badger.DB
 
@@ -74,6 +75,7 @@ func NewBadgerMetastore(
 	return &BadgerMetastore{
 		db:     db,
 		tracer: tracer,
+		logger: logger,
 	}
 }
 
@@ -485,6 +487,39 @@ func (m *BadgerMetastore) GetOrCreateStacktraces(ctx context.Context, r *pb.GetO
 		stacktraceKeys = append(stacktraceKeys, MakeStacktraceKey(stacktrace))
 	}
 
+	const maxRetries = 100
+	var result retryableGetOrCreateStacktraces
+	var err error
+
+	level.Debug(m.logger).Log("msg", "GetOrCreateStacktraces", "stacktrace_keys_len", len(r.Stacktraces))
+	for i := 0; i < maxRetries; i++ {
+		result, err = m.retryableGetOrCreateStacktraces(r, stacktraceKeys)
+		if err != nil {
+			return res, err
+		}
+
+		res.Stacktraces = append(res.Stacktraces, result.stackTraces...)
+		if len(result.retryWith) == 0 {
+			break
+		}
+		stacktraceKeys = result.retryWith
+		level.Debug(m.logger).Log("msg", "retrying GetOrCreateStacktraces", "stacktrace_keys_len", len(stacktraceKeys))
+	}
+
+	if len(result.retryWith) != 0 {
+		level.Debug(m.logger).Log("msg", "failed to GetOrCreateStacktraces all stacktraces", "stacktrace_keys_len", len(result.retryWith))
+		return res, fmt.Errorf("partial commit of stacktraces: %w", badger.ErrTxnTooBig)
+	}
+	return res, err
+}
+
+type retryableGetOrCreateStacktraces struct {
+	stackTraces []*pb.Stacktrace
+	retryWith   []string
+}
+
+func (m *BadgerMetastore) retryableGetOrCreateStacktraces(r *pb.GetOrCreateStacktracesRequest, stacktraceKeys []string) (retryableGetOrCreateStacktraces, error) {
+	result := retryableGetOrCreateStacktraces{}
 	err := m.db.Update(func(txn *badger.Txn) error {
 		for i, stacktraceKey := range stacktraceKeys {
 			item, err := txn.Get([]byte(stacktraceKey))
@@ -499,10 +534,20 @@ func (m *BadgerMetastore) GetOrCreateStacktraces(ctx context.Context, r *pb.GetO
 				if err != nil {
 					return err
 				}
-				if err := txn.Set([]byte(stacktraceKey), b); err != nil {
+				err = txn.Set([]byte(stacktraceKey), b)
+				if err != nil && err != badger.ErrTxnTooBig {
 					return err
 				}
-				res.Stacktraces = append(res.Stacktraces, stacktrace)
+
+				if err == badger.ErrTxnTooBig {
+					// force the calling function to commit the transaction
+					// we will go ahead and retry the operation
+					// from where we left off
+					result.retryWith = stacktraceKeys[i:]
+					return nil
+				}
+
+				result.stackTraces = append(result.stackTraces, stacktrace)
 				continue
 			}
 
@@ -513,7 +558,7 @@ func (m *BadgerMetastore) GetOrCreateStacktraces(ctx context.Context, r *pb.GetO
 					return err
 				}
 
-				res.Stacktraces = append(res.Stacktraces, stacktrace)
+				result.stackTraces = append(result.stackTraces, stacktrace)
 				return nil
 			})
 			if err != nil {
@@ -523,8 +568,7 @@ func (m *BadgerMetastore) GetOrCreateStacktraces(ctx context.Context, r *pb.GetO
 
 		return nil
 	})
-
-	return res, err
+	return result, err
 }
 
 func (m *BadgerMetastore) Stacktraces(ctx context.Context, r *pb.StacktracesRequest) (*pb.StacktracesResponse, error) {
